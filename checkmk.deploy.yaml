@@ -1,0 +1,222 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: checkmk
+  labels:
+    app.kubernetes.io/name: checkmk
+
+---
+
+# PersistentVolume manual — NFSv3 com nolock + local_lock=all
+# Evita o "Bad file descriptor" do flock() que ocorre sobre NFSv4 no OMD.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: checkmk-pv
+  labels:
+    app: checkmk
+spec:
+  capacity:
+    storage: 16Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    - hard
+    - vers=3
+    - local_lock=all
+    - nolock
+    - noatime
+    - rsize=1048576
+    - wsize=1048576
+  nfs:
+    path: /mnt/nfs-data/k8s/checkmk
+    server: 192.168.3.11
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkmk-pv-claim
+  namespace: checkmk
+spec:
+  storageClassName: ""
+  volumeName: checkmk-pv
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 16Gi
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkmk
+  namespace: checkmk
+data:
+  siteid: "cmk"
+  # NÃO usar timezones com underscore (America/Sao_Paulo) — bug no entrypoint.sh
+  # que usa '_' como separador no sed, quebrando o restart. Usar alias legado:
+  timezone: "Brazil/East"
+
+---
+
+apiVersion: v1
+kind: Secret
+type: Opaque
+metadata:
+  name: checkmk
+  namespace: checkmk
+data:
+  # Senha 'cmk' em base64. Troque em produção: echo -n 'senhaforte' | base64
+  password: "Y21r"
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkmk
+  namespace: checkmk
+  labels:
+    app: checkmk
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: checkmk
+  template:
+    metadata:
+      labels:
+        app: checkmk
+    spec:
+      restartPolicy: Always
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: checkmk
+          image: checkmk/check-mk-community:2.5.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: webport
+              containerPort: 5000
+              protocol: TCP
+            - name: agent-recv
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: CMK_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: checkmk
+                  key: password
+            - name: CMK_SITE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: checkmk
+                  key: siteid
+            - name: TZ
+              valueFrom:
+                configMapKeyRef:
+                  name: checkmk
+                  key: timezone
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          startupProbe:
+            httpGet:
+              path: /cmk/check_mk/login.py
+              port: 5000
+            failureThreshold: 60
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /cmk/check_mk/login.py
+              port: 5000
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /cmk/check_mk/login.py
+              port: 5000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: checkmk-data
+              mountPath: /omd/sites
+            - name: tmpfs
+              mountPath: /opt/omd/sites/cmk/tmp
+      volumes:
+        - name: checkmk-data
+          persistentVolumeClaim:
+            claimName: checkmk-pv-claim
+        - name: tmpfs
+          emptyDir:
+            medium: Memory
+            sizeLimit: "1Gi"
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkmk
+  namespace: checkmk
+  labels:
+    app: checkmk
+spec:
+  type: ClusterIP
+  selector:
+    app: checkmk
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+    - name: agent-receiver
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: checkmk
+  namespace: checkmk
+  annotations:
+    cert-manager.io/cluster-issuer: prod-letsencrypt-cloudflare
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: checkmk-k8s.staypuff.info
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: checkmk
+                port:
+                  number: 5000
+  tls:
+    - hosts:
+        - checkmk-k8s.staypuff.info
+      secretName: checkmk-k8s-tls
