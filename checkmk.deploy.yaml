@@ -95,12 +95,17 @@ spec:
       labels:
         app: checkmk
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       restartPolicy: Always
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: checkmk
+          securityContext:
+            capabilities:
+              add: ["NET_RAW"]
           image: checkmk/check-mk-community:2.5.0
           imagePullPolicy: IfNotPresent
           ports:
@@ -189,6 +194,31 @@ spec:
       port: 8000
       targetPort: 8000
       protocol: TCP
+
+---
+
+# LoadBalancer dedicado para o agent-receiver (porta 8000).
+# O Ingress não suporta TCP — agentes externos precisam de IP direto via MetalLB.
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkmk-agent-receiver
+  namespace: checkmk
+  labels:
+    app: checkmk
+spec:
+  type: LoadBalancer
+  selector:
+    app: checkmk
+  ports:
+    - name: agent-receiver
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    #- name: agent-old
+    #  port: 6556
+    #  targetPort: 8000
+    #  protocol: TCP
 
 ---
 
