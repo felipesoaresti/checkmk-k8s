@@ -1,77 +1,80 @@
-# CheckMK Community — Deploy Kubernetes (Homelab)
+*[Leia em Português](README.pt-BR.md)*
 
-Deploy do **CheckMK Community Edition 2.5.0** em Kubernetes com armazenamento NFS.
+# CheckMK Community — Kubernetes Deployment (Homelab)
 
-O YAML original foi criado pelo meu colega **Norman Sa Silva** para um cluster RKE1 corporativo e adaptado por mim para o meu homelab (k8s v1.35 / Debian 13 / Calico).
+Deploy of **CheckMK Community Edition 2.5.0** on Kubernetes with NFS-backed persistent storage.
+
+The original YAML was created by my colleague **Norman Sa Silva** for a corporate RKE1 cluster and adapted by me for my homelab (k8s v1.35 / Debian 13 / Calico).
 
 ---
 
-## Por que PersistentVolume manual em vez da StorageClass do homelab?
+## Why a manual PersistentVolume instead of the homelab StorageClass?
 
-O homelab usa a StorageClass `nfs-homelab` (provisionador `nfs.csi.k8s.io`) com **NFSv4.1**, que é o padrão recomendado para K8s moderno. No entanto, o **CheckMK/OMD tem um problema conhecido de file locking sobre NFSv4**: o processo interno usa `flock()` extensivamente para locking entre os serviços do site (Nagios, Apache, rrdcached, etc.), e o kernel Linux, ao operar sobre NFSv4 sem `local_lock`, envia essas chamadas ao servidor NFS — o que resulta em `OSError: [Errno 9] Bad file descriptor` e o container entra em crash loop.
+The homelab uses the `nfs-homelab` StorageClass (provisioner `nfs.csi.k8s.io`) with **NFSv4.1**, which is the recommended default for modern Kubernetes. However, **CheckMK/OMD has a known file locking issue over NFSv4**: the internal processes use `flock()` extensively for inter-service locking (Nagios, Apache, rrdcached, etc.), and the Linux kernel, when operating over NFSv4 without `local_lock`, forwards those calls to the NFS server — resulting in `OSError: [Errno 9] Bad file descriptor` and a container crash loop.
 
-A documentação oficial do CheckMK menciona esse comportamento para ambientes containerizados com volumes de rede:
+The official CheckMK documentation acknowledges this behavior for containerized environments with network volumes:
 
 > *"If you use an NFS volume, make sure that file locking works correctly. Some NFS configurations do not support POSIX file locking, which can cause issues with the OMD site."*
 > — [CheckMK Docker documentation](https://docs.checkmk.com/latest/en/introduction_docker.html)
 
-### Solução: PV manual com NFSv3 + nolock + local_lock=all
+### Solution: manual PV with NFSv3 + nolock + local_lock=all
 
-Usando um `PersistentVolume` manual é possível especificar as mount options diretamente no objeto PV — algo que o provisionador CSI dinâmico aplica a nível de StorageClass (afetando todos os workloads que a usam). Com um PV dedicado para o CheckMK, as opções ficam isoladas:
+Using a manual `PersistentVolume` allows mount options to be specified directly on the PV object — unlike dynamic CSI provisioning, which applies options at the StorageClass level (affecting all workloads using it). With a dedicated PV for CheckMK, the options are fully isolated:
 
 ```yaml
 mountOptions:
-  - vers=3          # NFSv3: sem o problema de locking do NFSv4 com flock()
-  - nolock          # Não envia lock requests ao servidor NFS
-  - local_lock=all  # Todo o locking (flock + posix) é resolvido localmente no node
+  - vers=3          # NFSv3: no NFSv4 locking issue with flock()
+  - nolock          # Do not send lock requests to the NFS server
+  - local_lock=all  # Resolve all locking (flock + posix) locally on the node
   - hard
   - noatime
   - rsize=1048576
   - wsize=1048576
 ```
 
-**Por que não alterar a StorageClass do homelab?**  
-A StorageClass `nfs-homelab` é usada por outros workloads (n8n, postgres, cotacoes, etc.) que funcionam corretamente com NFSv4.1. Mudar as mount options globalmente poderia impactar esses serviços — e `local_lock=all` não é recomendado para workloads multi-pod que dependem de locking distribuído real. O PV manual mantém o CheckMK isolado com a configuração que ele precisa.
+**Why not modify the existing StorageClass?**
+The `nfs-homelab` StorageClass is shared by other workloads (n8n, postgres, cotacoes, etc.) that work correctly with NFSv4.1. Changing the mount options globally could break those services — and `local_lock=all` is not recommended for multi-pod workloads that rely on real distributed locking. The manual PV keeps CheckMK isolated with exactly the configuration it needs.
 
-**Por que NFSv3 funciona?**  
-No NFSv3, a semântica de `flock()` com `nolock` faz o kernel resolver o locking inteiramente no lado do cliente (node K8s), sem consultar o servidor. Como o CheckMK roda em um único pod (`strategy: Recreate`), não há risco de conflito entre instâncias — o locking local é suficiente e correto.
+**Why does NFSv3 work?**
+With NFSv3, using `flock()` with `nolock` makes the kernel resolve locking entirely on the client side (the K8s node), without contacting the NFS server. Since CheckMK runs as a single pod (`strategy: Recreate`), there is no risk of conflict between instances — local locking is both sufficient and correct.
 
 ---
 
-## Estrutura do deploy
+## Deploy structure
 
 ```
 checkmk.deploy.yaml
 ├── Namespace
-├── PersistentVolume       # PV manual NFSv3 dedicado
-├── PersistentVolumeClaim  # Bind direto ao PV (storageClassName: "")
+├── PersistentVolume       # Manual PV — NFSv3 with dedicated mount options
+├── PersistentVolumeClaim  # Direct bind to the PV (storageClassName: "")
 ├── ConfigMap              # siteid + timezone
 ├── Secret                 # CMK_PASSWORD
-├── Deployment             # 1 réplica, strategy Recreate
-│   ├── emptyDir (tmpfs)   # /opt/omd/sites/cmk/tmp — volátil, em memória
-│   └── NFS PVC            # /omd/sites — persistente
-├── Service                # ClusterIP porta 5000
+├── Deployment             # 1 replica, Recreate strategy
+│   ├── emptyDir (tmpfs)   # /opt/omd/sites/cmk/tmp — volatile, in-memory
+│   └── NFS PVC            # /omd/sites — persistent
+├── Service (ClusterIP)    # Port 5000 — internal access
+├── Service (LoadBalancer) # Port 8000 — Agent Receiver (MetalLB, TCP)
 └── Ingress                # nginx + cert-manager (Let's Encrypt)
 ```
 
-### Por que emptyDir para o tmp?
+### Why emptyDir for /tmp?
 
-O diretório `/opt/omd/sites/cmk/tmp` contém arquivos de estado voláteis (sockets, PIDs, checkresults, status.dat). A documentação oficial recomenda usar tmpfs para esse diretório em ambientes containerizados:
+The `/opt/omd/sites/cmk/tmp` directory holds volatile state files (sockets, PIDs, checkresults, status.dat). The official documentation recommends mounting a tmpfs there for containerized deployments:
 
 > *"Mount a tmpfs to /opt/omd/sites/\<site\>/tmp to improve performance and avoid unnecessary writes to the persistent volume."*
 > — [CheckMK Docker documentation](https://docs.checkmk.com/latest/en/introduction_docker.html)
 
-Sem o emptyDir, esses arquivos iriam para o NFS, aumentando a latência de I/O e gerando escrita desnecessária a cada check.
+Without the emptyDir, those files would land on NFS, increasing I/O latency and generating unnecessary writes on every check cycle.
 
 ---
 
-## Pré-requisitos
+## Prerequisites
 
 - Kubernetes 1.28+
-- Ingress NGINX
-- cert-manager com ClusterIssuer `prod-letsencrypt-cloudflare`
-- Servidor NFS acessível (ajuste `server` e `path` no PV)
-- Diretório NFS criado previamente no servidor:
+- NGINX Ingress Controller
+- cert-manager with ClusterIssuer `prod-letsencrypt-cloudflare`
+- Accessible NFS server (update `server` and `path` in the PV spec)
+- NFS directory created on the server beforehand:
   ```bash
   mkdir -p /mnt/nfs-data/k8s/checkmk
   chmod 777 /mnt/nfs-data/k8s/checkmk
@@ -79,68 +82,68 @@ Sem o emptyDir, esses arquivos iriam para o NFS, aumentando a latência de I/O e
 
 ---
 
-## Como aplicar
+## Applying the manifest
 
 ```bash
-# Ajuste o host no Ingress e o path/server do NFS no PV antes de aplicar
+# Edit the Ingress host and the NFS server/path in the PV before applying
 kubectl apply -f checkmk.deploy.yaml
 
-# Acompanhe o primeiro start (pode levar 2-3 min para o omd create)
+# Follow the first startup (omd site creation can take 2-3 minutes)
 kubectl logs -n checkmk -f deployment/checkmk
 
-# Aguarde o pod ficar Ready (startupProbe tem 10 min de tolerância)
+# Wait for the pod to become Ready (startupProbe tolerates up to 10 minutes)
 kubectl get pod -n checkmk -w
 ```
 
-Acesso: `https://checkmk-k8s.staypuff.info/cmk/` — usuário `cmkadmin`, senha conforme o Secret.
+Access: `https://checkmk-k8s.staypuff.info/cmk/` — user `cmkadmin`, password as defined in the Secret.
 
 ---
 
-## Variáveis de ambiente importantes
+## Key environment variables
 
-| Variável | Valor | Observação |
+| Variable | Value | Notes |
 |---|---|---|
-| `CMK_SITE_ID` | `cmk` | Nome do site OMD |
-| `CMK_PASSWORD` | base64 | Senha do `cmkadmin` |
-| `TZ` | `Brazil/East` | **Não usar** `America/Sao_Paulo` — bug no entrypoint.sh que usa `_` como separador no `sed`, quebrando o restart |
+| `CMK_SITE_ID` | `cmk` | OMD site name |
+| `CMK_PASSWORD` | base64 | Password for `cmkadmin` |
+| `TZ` | `Brazil/East` | **Do not use** `America/Sao_Paulo` — the entrypoint.sh uses `_` as a separator in a `sed` command, which breaks the site restart |
 
 ---
 
-## Troubleshooting: agentes legados não coletam (pull mode)
+## Troubleshooting: legacy agents not collecting (pull mode)
 
-Esta seção documenta um problema real encontrado durante o deploy e a investigação completa que levou à solução.
+This section documents a real issue encountered during deployment and the full investigation that led to the fix.
 
-### Sintoma
+### Symptom
 
-O pod subia normalmente, a UI do CheckMK estava acessível, mas hosts configurados apareciam como `DOWN` e sem dados. O comando de diagnóstico retornava:
+The pod started normally and the CheckMK UI was accessible, but monitored hosts appeared as `DOWN` with no data. The diagnostic command returned:
 
 ```
 ERROR [agent]: Communication failed: timed out
 ```
 
-### Contexto: como o pull mode funciona
+### Context: how pull mode works
 
-O CheckMK tem dois modos de comunicação com agentes:
+CheckMK supports two agent communication modes:
 
-| Modo | Direção | Porta |
+| Mode | Direction | Port |
 |---|---|---|
-| **Pull (legado)** | CheckMK server → host monitorado | 6556 (no host) |
-| **Push (Agent Controller)** | host monitorado → CheckMK server | 8000 (no server) |
+| **Pull (legacy)** | CheckMK server → monitored host | 6556 (on the host) |
+| **Push (Agent Controller)** | Monitored host → CheckMK server | 8000 (on the server) |
 
-No pull mode, **o servidor inicia a conexão**. O agente escuta na porta 6556 do host monitorado e responde com os dados. Nenhuma porta precisa ser exposta no pod para pull mode.
+In pull mode, **the server initiates the connection**. The agent listens on port 6556 of the monitored host and responds with data. No port needs to be exposed on the pod for pull mode.
 
 ---
 
-### Investigação passo a passo
+### Step-by-step investigation
 
-#### Etapa 1 — Verificar se o pod consegue pingar os hosts
+#### Step 1 — Verify the pod can ping hosts
 
 ```bash
 sudo kubectl exec -it -n checkmk <pod> -- bash
 ping -c2 192.168.3.31
 ```
 
-**Resultado:** ping funcionando. Isso confirmou que a rede básica estava ok, mas era necessário `NET_RAW` capability para o CheckMK enviar ICMP — adicionado no container:
+**Result:** ping worked. Basic networking was fine, but CheckMK needed `NET_RAW` capability to send ICMP — added to the container:
 
 ```yaml
 securityContext:
@@ -148,32 +151,32 @@ securityContext:
     add: ["NET_RAW"]
 ```
 
-#### Etapa 2 — Verificar conectividade TCP na porta do agente
+#### Step 2 — Verify TCP connectivity on the agent port
 
 ```bash
-# De dentro do pod
+# From inside the pod
 nc -zw3 192.168.3.11 6556; echo EXIT:$?
 ```
 
-**Resultado:** `EXIT:0` — a conexão TCP era estabelecida. O problema não era firewall nem rota básica.
+**Result:** `EXIT:0` — the TCP connection was established. The problem was not a firewall or routing issue.
 
-#### Etapa 3 — Verificar se o agente manda dados
+#### Step 3 — Verify if the agent sends data
 
 ```bash
-# De dentro do pod
+# From inside the pod
 timeout 5 bash -c 'cat < /dev/tcp/192.168.3.11/6556' | head -3
 ```
 
-**Resultado:** nenhum dado recebido. O TCP conecta mas o agente não responde.
+**Result:** no data received. TCP connects but the agent does not respond.
 
-#### Etapa 4 — Verificar o estado do agente no host monitorado
+#### Step 4 — Inspect the agent state on the monitored host
 
 ```bash
-# No PVE1 (192.168.3.11)
+# On PVE1 (192.168.3.11)
 cmk-agent-ctl status --json
 ```
 
-**Resultado:**
+**Result:**
 ```json
 {
   "version": "2.4.0p25",
@@ -184,97 +187,97 @@ cmk-agent-ctl status --json
 }
 ```
 
-O agente estava com `allow_legacy_pull: true` e `ip_allowlist: []` (sem restrição de IP). Não era `only_from` bloqueando.
+The agent had `allow_legacy_pull: true` and `ip_allowlist: []` (no IP restriction). `only_from` was not the blocker.
 
-#### Etapa 5 — Confirmar que o agente funciona de outros hosts
+#### Step 5 — Confirm the agent works from other hosts
 
 ```bash
-# Do k8s-master (192.168.3.30)
+# From k8s-master (192.168.3.30)
 timeout 5 bash -c 'cat < /dev/tcp/192.168.3.11/6556' | head -3
 ```
 
-**Resultado:**
+**Result:**
 ```
 <<<check_mk>>>
 Version: 2.4.0p25
 AgentOS: linux
 ```
 
-Do master funcionava. Do pod, não. Mesma porta, mesmo host — comportamento diferente.
+It worked from the master but not from the pod. Same port, same host — different behaviour.
 
-#### Etapa 6 — Captura de tráfego (tcpdump) — a prova definitiva
+#### Step 6 — Packet capture (tcpdump) — the definitive proof
 
-Iniciamos um `tcpdump` no PVE1 enquanto o pod tentava conectar:
+A `tcpdump` was running on PVE1 while the pod attempted to connect:
 
 ```bash
-# No PVE1
+# On PVE1
 tcpdump -n -i nic0 port 6556
 
-# Simultaneamente, no pod
+# Simultaneously, in the pod
 timeout 5 bash -c 'cat < /dev/tcp/192.168.3.11/6556'
 ```
 
-**Evidência capturada:**
+**Captured evidence:**
 
 ```
-# Conexão do SERVIDOR ANTIGO (192.168.3.5) — funciona normalmente:
+# Connection from the OLD SERVER (192.168.3.5) — works normally:
 09:02:24 IP 192.168.3.5.42496  > 192.168.3.31.6556:  Flags [S]   # SYN
 09:02:24 IP 192.168.3.31.6556  > 192.168.3.5.42496:  Flags [S.]  # SYN-ACK
 09:02:24 IP 192.168.3.5.42496  > 192.168.3.31.6556:  Flags [.]   # ACK
-09:02:26 IP 192.168.3.31.6556  > 192.168.3.5.42496:  Flags [.]   # dados fluindo (183KB)
+09:02:26 IP 192.168.3.31.6556  > 192.168.3.5.42496:  Flags [.]   # data flowing (183KB)
 
-# Conexão do POD (192.168.194.91) — PROBLEMA:
-09:02:25 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (1ª tentativa)
-09:02:26 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmissão)
-09:02:26 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmissão)
-09:02:27 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmissão)
-09:02:28 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmissão)
-09:02:30 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmissão)
+# Connection from the POD (192.168.194.91) — PROBLEM:
+09:02:25 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (1st attempt)
+09:02:26 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmit)
+09:02:26 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmit)
+09:02:27 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmit)
+09:02:28 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmit)
+09:02:30 IP 192.168.3.11.6556  > 192.168.194.91.37990: Flags [S.] # SYN-ACK (retransmit)
 ```
 
-**Diagnóstico:** o PVE1 nunca recebeu o ACK do pod. O handshake TCP nunca se completou — o SYN-ACK era enviado mas o pod não o recebia (retransmissões infinitas).
+**Diagnosis:** PVE1 never received the ACK from the pod. The TCP handshake never completed — SYN-ACK was sent but the pod never received it (infinite retransmissions).
 
 ---
 
-### Causa raiz: sobreposição de CIDR + Calico sem MASQUERADE
+### Root cause: CIDR overlap + Calico without MASQUERADE
 
-O cluster usa Calico com pod CIDR `192.168.0.0/16`.
+The cluster uses Calico with pod CIDR `192.168.0.0/16`.
 
-A rede física do homelab também usa `192.168.3.0/24` — que está **dentro** do range `192.168.0.0/16`.
+The homelab physical network uses `192.168.3.0/24` — which falls **inside** the `192.168.0.0/16` range.
 
-Quando o pod (IP `192.168.194.91`) enviava um pacote para o PVE1 (`192.168.3.11`):
+When the pod (IP `192.168.194.91`) sent a packet to PVE1 (`192.168.3.11`):
 
 ```
 Pod 192.168.194.91 ──SYN──▶ PVE1 192.168.3.11
 ```
 
-O Calico interpretava o destino `192.168.3.x` como **pertencente ao pod CIDR** e **não aplicava MASQUERADE (SNAT)**. O pacote chegava ao PVE1 com source IP real do pod (`192.168.194.91`).
+Calico interpreted the destination `192.168.3.x` as **belonging to the pod CIDR** and **did not apply MASQUERADE (SNAT)**. The packet arrived at PVE1 with the pod's real source IP (`192.168.194.91`).
 
-O PVE1 tentava responder:
+PVE1 tried to reply:
 
 ```
 PVE1 192.168.3.11 ──SYN-ACK──▶ 192.168.194.91 ???
 ```
 
-Mas o PVE1 não tinha rota para `192.168.194.0/24` — essa sub-rede só existe dentro do cluster Kubernetes. O SYN-ACK ia para o gateway padrão e se perdia. O handshake nunca se completava.
+But PVE1 had no route to `192.168.194.0/24` — that subnet only exists inside the Kubernetes cluster. The SYN-ACK was sent to the default gateway and dropped. The handshake never completed.
 
-Isso explicava por que `nc -z` às vezes retornava 0 (o SYN chegava ao PVE1), mas nenhum dado era recebido (o handshake não se completava).
+This explained why `nc -z` sometimes returned 0 (the SYN reached PVE1), but no data was ever received (the handshake did not complete).
 
-> **Por que do master/worker funcionava?**
-> Conexões de `192.168.3.30` ou `192.168.3.31` são IPs físicos normais. O PVE1 sabe rotear a resposta de volta para `192.168.3.x` pela rede local — o handshake completa normalmente.
+> **Why did it work from the master/worker nodes?**
+> Connections from `192.168.3.30` or `192.168.3.31` use physical IPs. PVE1 knows how to route the response back to `192.168.3.x` over the local network — the handshake completes normally.
 
 ---
 
-### Solução: `hostNetwork: true`
+### Fix: `hostNetwork: true`
 
-Com `hostNetwork: true`, o pod não tem um IP de pod (`192.168.194.x`). Ele usa diretamente o IP do nó em que está rodando (`192.168.3.31`).
+With `hostNetwork: true`, the pod has no pod IP (`192.168.194.x`). It uses the IP of the node it is scheduled on (`192.168.3.31`) directly.
 
 ```
-Pod usando 192.168.3.31 ──SYN──▶ PVE1 192.168.3.11
-PVE1 192.168.3.11 ──SYN-ACK──▶ 192.168.3.31  ✓ (rota conhecida)
+Pod using 192.168.3.31 ──SYN──▶ PVE1 192.168.3.11
+PVE1 192.168.3.11 ──SYN-ACK──▶ 192.168.3.31  ✓ (known route)
 ```
 
-O campo `dnsPolicy: ClusterFirstWithHostNet` é necessário para que o pod continue resolvendo nomes de serviços internos do cluster (ex: `checkmk.svc.cluster.local`) mesmo usando a rede do host.
+The `dnsPolicy: ClusterFirstWithHostNet` field is required so the pod continues resolving internal cluster service names (e.g. `checkmk.svc.cluster.local`) even while using the host network.
 
 ```yaml
 spec:
@@ -282,15 +285,15 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
 ```
 
-#### Verificação após o fix
+#### Verification after the fix
 
 ```bash
-# IP do pod agora é o IP do nó
+# Pod IP is now the node IP
 sudo kubectl get pods -n checkmk -o wide
 # NAME                       READY   STATUS    IP             NODE
 # checkmk-547c56b7bd-m27xd   1/1     Running   192.168.3.31   k8s-worker1
 
-# Coleta funcionando
+# Collection working
 su - cmk -c "cmk -vd PVE1"
 # <<<check_mk>>>
 # Version: 2.4.0p25
@@ -299,20 +302,20 @@ su - cmk -c "cmk -vd PVE1"
 # ...
 ```
 
-#### Alternativas consideradas e descartadas
+#### Alternatives considered and discarded
 
-| Alternativa | Por que não |
+| Alternative | Reason discarded |
 |---|---|
-| Rotas estáticas em cada host monitorado | Frágil: o pod pode mover de nó entre restarts |
-| Mudar o pod CIDR do cluster | Requer rebuild completo do cluster |
-| BGP entre Calico e roteador físico | Complexidade desnecessária para homelab |
+| Static routes on each monitored host | Fragile: the pod can move to a different node between restarts |
+| Changing the cluster pod CIDR | Requires a full cluster rebuild |
+| BGP peering between Calico and the physical router | Unnecessary complexity for a homelab |
 
 ---
 
-## Referências
+## References
 
-- [CheckMK Docker — documentação oficial](https://docs.checkmk.com/latest/en/introduction_docker.html)
+- [CheckMK Docker — official documentation](https://docs.checkmk.com/latest/en/introduction_docker.html)
 - [CheckMK Docker Hub](https://hub.docker.com/r/checkmk/check-mk-community)
 - [OMD — Open Monitoring Distribution](https://omdistro.org/)
-- [Calico — pod CIDR e MASQUERADE](https://docs.tigera.io/calico/latest/networking/configuring/bgp)
+- [Calico — pod CIDR and MASQUERADE](https://docs.tigera.io/calico/latest/networking/configuring/bgp)
 - [Kubernetes hostNetwork](https://kubernetes.io/docs/concepts/policy/pod-security-policy/#host-namespaces)
